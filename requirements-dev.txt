@@ -3,11 +3,13 @@ numpy
 pytest
 pytest-cov
 pytest-xdist
+pytest-timeout
 dill
+filelock
 setuptools
 # Test contrib dependencies
 scipy
-pytorch_fid==0.1.1
+pytorch_fid
 tqdm
 scikit-learn
 matplotlib
@@ -19,12 +21,15 @@ mlflow
 neptune-client>=0.16.17
 tensorboard
 torchvision
-pynvml
+pynvml<12  # pynvml module was removed in 12.X, is not developed or maintained. We should replace pynvml with something else.
 clearml
 scikit-image
 py-rouge
-nltk
+# temporary fix for python=3.12 and v3.8.1
+# nltk
+git+https://github.com/nltk/nltk@aba99c8
 # Examples dependencies
 pandas
 gymnasium
-mkl;platform_machine=="x86_64"
+# temporary fix: E   AttributeError: module 'mpmath' has no attribute 'rational'
+mpmath<1.4

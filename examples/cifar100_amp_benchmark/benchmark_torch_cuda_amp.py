@@ -1,14 +1,15 @@
 import fire
 import torch
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 from torch.nn import CrossEntropyLoss
 from torch.optim import SGD
 from torchvision.models import wide_resnet50_2
 from utils import get_train_eval_loaders
 
-from ignite.contrib.handlers import ProgressBar
 from ignite.engine import convert_tensor, create_supervised_evaluator, Engine, Events
-from ignite.handlers import Timer
+
+from ignite.handlers import ProgressBar, Timer
 from ignite.metrics import Accuracy, Loss
 
 
@@ -34,7 +35,7 @@ def main(dataset_path, batch_size=256, max_epochs=10):
         optimizer.zero_grad()
 
         # Runs the forward pass with autocasting.
-        with autocast():
+        with autocast("cuda"):
             y_pred = model(x)
             loss = criterion(y_pred, y)
 

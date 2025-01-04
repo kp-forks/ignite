@@ -96,7 +96,7 @@ def supervised_training_step(
         Added `model_transform` to transform model's output
     .. versionchanged:: 0.4.13
         Added `model_fn` to customize model's application on the sample
-    .. versionchanged:: 0.4.14
+    .. versionchanged:: 0.5.0
         Added support for ``mps`` device
     """
 
@@ -185,9 +185,9 @@ def supervised_training_step_amp(
     """
 
     try:
-        from torch.cuda.amp import autocast
+        from torch.amp import autocast
     except ImportError:
-        raise ImportError("Please install torch>=1.6.0 to use amp_mode='amp'.")
+        raise ImportError("Please install torch>=1.12.0 to use amp_mode='amp'.")
 
     if gradient_accumulation_steps <= 0:
         raise ValueError(
@@ -200,7 +200,7 @@ def supervised_training_step_amp(
             optimizer.zero_grad()
         model.train()
         x, y = prepare_batch(batch, device=device, non_blocking=non_blocking)
-        with autocast(enabled=True):
+        with autocast("cuda", enabled=True):
             output = model_fn(model, x)
             y_pred = model_transform(output)
             loss = loss_fn(y_pred, y)
@@ -480,7 +480,7 @@ def create_supervised_trainer(
 
             from ignite.engine import create_supervised_trainer
             from ignite.utils import convert_tensor
-            from ignite.contrib.handlers.tqdm_logger import ProgressBar
+            from ignite.handlers.tqdm_logger import ProgressBar
 
             model = ...
             loss = ...
@@ -551,7 +551,7 @@ def create_supervised_trainer(
         Added ``model_transform`` to transform model's output
     .. versionchanged:: 0.4.13
         Added `model_fn` to customize model's application on the sample
-    .. versionchanged:: 0.4.14
+    .. versionchanged:: 0.5.0
         Added support for ``mps`` device
     """
 
@@ -726,15 +726,15 @@ def supervised_evaluation_step_amp(
         Added `model_fn` to customize model's application on the sample
     """
     try:
-        from torch.cuda.amp import autocast
+        from torch.amp import autocast
     except ImportError:
-        raise ImportError("Please install torch>=1.6.0 to use amp_mode='amp'.")
+        raise ImportError("Please install torch>=1.12.0 to use amp_mode='amp'.")
 
     def evaluate_step(engine: Engine, batch: Sequence[torch.Tensor]) -> Union[Any, Tuple[torch.Tensor]]:
         model.eval()
         with torch.no_grad():
             x, y = prepare_batch(batch, device=device, non_blocking=non_blocking)
-            with autocast(enabled=True):
+            with autocast("cuda", enabled=True):
                 output = model_fn(model, x)
                 y_pred = model_transform(output)
             return output_transform(x, y, y_pred)
@@ -799,7 +799,7 @@ def create_supervised_evaluator(
         Added ``model_transform`` to transform model's output
     .. versionchanged:: 0.4.13
         Added `model_fn` to customize model's application on the sample
-    .. versionchanged:: 0.4.14
+    .. versionchanged:: 0.5.0
         Added support for ``mps`` device
     """
     device_type = device.type if isinstance(device, torch.device) else device

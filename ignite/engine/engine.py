@@ -139,8 +139,12 @@ class Engine(Serializable):
         self.logger = logging.getLogger(__name__ + "." + self.__class__.__name__)
         self._process_function = process_function
         self.last_event_name: Optional[Events] = None
-        self.should_terminate = False
-        self.should_terminate_single_epoch = False
+        # should_terminate flag: False - don't terminate, True - terminate,
+        # "skip_completed" - terminate and skip the event "COMPLETED"
+        self.should_terminate: Union[bool, str] = False
+        # should_terminate_single_epoch flag: False - don't terminate, True - terminate,
+        # "skip_epoch_completed" - terminate and skip the event "EPOCH_COMPLETED"
+        self.should_terminate_single_epoch: Union[bool, str] = False
         self.should_interrupt = False
         self.state = State()
         self._state_dict_user_keys: List[str] = []
@@ -157,7 +161,7 @@ class Engine(Serializable):
         _check_signature(process_function, "process_function", self, None)
 
         # generator provided by self._internal_run_as_gen
-        self._internal_run_generator: Optional[Generator] = None
+        self._internal_run_generator: Optional[Generator[Any, None, State]] = None
 
     def register_events(
         self, *event_names: Union[List[str], List[EventEnum]], event_to_attr: Optional[dict] = None
@@ -538,15 +542,18 @@ class Engine(Serializable):
         self.logger.info("interrupt signaled. Engine will interrupt the run after current iteration is finished.")
         self.should_interrupt = True
 
-    def terminate(self) -> None:
+    def terminate(self, skip_completed: bool = False) -> None:
         """Sends terminate signal to the engine, so that it terminates completely the run. The run is
         terminated after the event on which ``terminate`` method was called. The following events are triggered:
 
         - ...
         - Terminating event
         - :attr:`~ignite.engine.events.Events.TERMINATE`
-        - :attr:`~ignite.engine.events.Events.COMPLETED`
+        - :attr:`~ignite.engine.events.Events.COMPLETED` (unless `skip_completed=True`)
 
+        Args:
+            skip_completed: if True, the event :attr:`~ignite.engine.events.Events.COMPLETED` is not fired after
+                :attr:`~ignite.engine.events.Events.TERMINATE`. Default is False.
 
         Examples:
             .. testcode::
@@ -617,26 +624,35 @@ class Engine(Serializable):
         .. versionchanged:: 0.4.10
             Behaviour changed, for details see https://github.com/pytorch/ignite/issues/2669
 
+        .. versionchanged:: 0.5.2
+            Added `skip_completed` flag
         """
         self.logger.info("Terminate signaled. Engine will stop after current iteration is finished.")
-        self.should_terminate = True
+        self.should_terminate = "skip_completed" if skip_completed else True
 
-    def terminate_epoch(self) -> None:
+    def terminate_epoch(self, skip_epoch_completed: bool = False) -> None:
         """Sends terminate signal to the engine, so that it terminates the current epoch. The run
         continues from the next epoch. The following events are triggered:
 
         - ...
         - Event on which ``terminate_epoch`` method is called
         - :attr:`~ignite.engine.events.Events.TERMINATE_SINGLE_EPOCH`
-        - :attr:`~ignite.engine.events.Events.EPOCH_COMPLETED`
+        - :attr:`~ignite.engine.events.Events.EPOCH_COMPLETED` (unless `skip_epoch_completed=True`)
         - :attr:`~ignite.engine.events.Events.EPOCH_STARTED`
         - ...
+
+        Args:
+            skip_epoch_completed: if True, the event :attr:`~ignite.engine.events.Events.EPOCH_COMPLETED`
+                is not fired after :attr:`~ignite.engine.events.Events.TERMINATE_SINGLE_EPOCH`. Default is False.
+
+        .. versionchanged:: 0.5.2
+            Added `skip_epoch_completed` flag
         """
         self.logger.info(
             "Terminate current epoch is signaled. "
             "Current epoch iteration will stop after current iteration is finished."
         )
-        self.should_terminate_single_epoch = True
+        self.should_terminate_single_epoch = "skip_epoch_completed" if skip_epoch_completed else True
 
     def _handle_exception(self, e: BaseException) -> None:
         if Events.EXCEPTION_RAISED in self._event_handlers:
@@ -951,7 +967,7 @@ class Engine(Serializable):
             self._internal_run_generator = None
             return out.value
 
-    def _internal_run_as_gen(self) -> Generator:
+    def _internal_run_as_gen(self) -> Generator[Any, None, State]:
         self.should_terminate = self.should_terminate_single_epoch = self.should_interrupt = False
         self._init_timers(self.state)
         try:
@@ -975,11 +991,17 @@ class Engine(Serializable):
                     # time is available for handlers but must be updated after fire
                     self.state.times[Events.EPOCH_COMPLETED.name] = epoch_time_taken
 
-                    handlers_start_time = time.time()
-                    self._fire_event(Events.EPOCH_COMPLETED)
-                    epoch_time_taken += time.time() - handlers_start_time
-                    # update time wrt handlers
-                    self.state.times[Events.EPOCH_COMPLETED.name] = epoch_time_taken
+                    if self.should_terminate_single_epoch != "skip_epoch_completed":  # type: ignore[comparison-overlap]
+                        handlers_start_time = time.time()
+                        self._fire_event(Events.EPOCH_COMPLETED)
+                        epoch_time_taken += time.time() - handlers_start_time
+                        # update time wrt handlers
+                        self.state.times[Events.EPOCH_COMPLETED.name] = epoch_time_taken
+
+                    if self.should_terminate_single_epoch:
+                        # We skip raising _EngineTerminateSingleEpochException exception on Events.EPOCH_COMPLETED
+                        # as epoch is already completed and nothing to terminate
+                        self.should_terminate_single_epoch = False
                     yield from self._maybe_terminate_or_interrupt()
 
                     hours, mins, secs = _to_hours_mins_secs(epoch_time_taken)
@@ -990,16 +1012,27 @@ class Engine(Serializable):
             except _EngineTerminateException:
                 self._fire_event(Events.TERMINATE)
 
+            except _EngineTerminateSingleEpochException:
+                raise RuntimeError(
+                    "The method terminate_epoch() should not be called on Event.STARTED or Event.EPOCH_STARTED."
+                    "If this is a desired behaviour, please open a feature request on"
+                    "https://github.com/pytorch/ignite/issues/new/choose"
+                )
+
             time_taken = time.time() - start_time
             # time is available for handlers but must be updated after fire
             self.state.times[Events.COMPLETED.name] = time_taken
-            handlers_start_time = time.time()
-            self._fire_event(Events.COMPLETED)
-            time_taken += time.time() - handlers_start_time
-            # update time wrt handlers
-            self.state.times[Events.COMPLETED.name] = time_taken
+
+            # do not fire Events.COMPLETED if we terminated the run with flag `skip_completed=True`
+            if self.should_terminate != "skip_completed":  # type: ignore[comparison-overlap]
+                handlers_start_time = time.time()
+                self._fire_event(Events.COMPLETED)
+                time_taken += time.time() - handlers_start_time
+                # update time wrt handlers
+                self.state.times[Events.COMPLETED.name] = time_taken
+
             hours, mins, secs = _to_hours_mins_secs(time_taken)
-            self.logger.info(f"Engine run complete. Time taken: {hours:02d}:{mins:02d}:{secs:06.3f}")
+            self.logger.info(f"Engine run finished. Time taken: {hours:02d}:{mins:02d}:{secs:06.3f}")
 
         except BaseException as e:
             self._dataloader_iter = None
@@ -1037,15 +1070,23 @@ class Engine(Serializable):
 
             while True:
                 self.state.batch = self.state.output = None
+
                 try:
                     # Avoid Events.GET_BATCH_STARTED triggered twice when data iter is restarted
                     if self.last_event_name != Events.DATALOADER_STOP_ITERATION:
-                        self._fire_event(Events.GET_BATCH_STARTED)
-                        yield from self._maybe_terminate_or_interrupt()
+                        # We should not trigger GET_BATCH_STARTED, GET_BATCH_COMPLETED, DATALOADER_STOP_ITERATION events
+                        # if no data was provided to engine.run(data=None, ...)
+                        if self.state.dataloader is not None:
+                            self._fire_event(Events.GET_BATCH_STARTED)
+                            yield from self._maybe_terminate_or_interrupt()
 
                     self.state.batch = next(self._dataloader_iter)
-                    self._fire_event(Events.GET_BATCH_COMPLETED)
-                    yield from self._maybe_terminate_or_interrupt()
+
+                    # We should not trigger GET_BATCH_STARTED, GET_BATCH_COMPLETED, DATALOADER_STOP_ITERATION events
+                    # if no data was provided to engine.run(data=None, ...)
+                    if self.state.dataloader is not None:
+                        self._fire_event(Events.GET_BATCH_COMPLETED)
+                        yield from self._maybe_terminate_or_interrupt()
 
                     iter_counter += 1
                     should_exit = False
@@ -1074,8 +1115,11 @@ class Engine(Serializable):
                             )
                         break
 
-                    self._fire_event(Events.DATALOADER_STOP_ITERATION)
-                    yield from self._maybe_terminate_or_interrupt()
+                    # We should not trigger GET_BATCH_STARTED, GET_BATCH_COMPLETED, DATALOADER_STOP_ITERATION events
+                    # if no data was provided to engine.run(data=None, ...)
+                    if self.state.dataloader is not None:
+                        self._fire_event(Events.DATALOADER_STOP_ITERATION)
+                        yield from self._maybe_terminate_or_interrupt()
 
                     self._setup_dataloader_iter()
                     should_exit = True
@@ -1099,7 +1143,6 @@ class Engine(Serializable):
 
         except _EngineTerminateSingleEpochException:
             self._fire_event(Events.TERMINATE_SINGLE_EPOCH, iter_counter=iter_counter)
-            self.should_terminate_single_epoch = False
             self._setup_dataloader_iter()
 
         except _EngineTerminateException as e:
@@ -1145,11 +1188,17 @@ class Engine(Serializable):
                     # time is available for handlers but must be updated after fire
                     self.state.times[Events.EPOCH_COMPLETED.name] = epoch_time_taken
 
-                    handlers_start_time = time.time()
-                    self._fire_event(Events.EPOCH_COMPLETED)
-                    epoch_time_taken += time.time() - handlers_start_time
-                    # update time wrt handlers
-                    self.state.times[Events.EPOCH_COMPLETED.name] = epoch_time_taken
+                    if self.should_terminate_single_epoch != "skip_epoch_completed":  # type: ignore[comparison-overlap]
+                        handlers_start_time = time.time()
+                        self._fire_event(Events.EPOCH_COMPLETED)
+                        epoch_time_taken += time.time() - handlers_start_time
+                        # update time wrt handlers
+                        self.state.times[Events.EPOCH_COMPLETED.name] = epoch_time_taken
+
+                    if self.should_terminate_single_epoch:
+                        # We skip raising _EngineTerminateSingleEpochException exception on Events.EPOCH_COMPLETED
+                        # as epoch is already completed and nothing to terminate
+                        self.should_terminate_single_epoch = False
                     self._maybe_terminate_legacy()
 
                     hours, mins, secs = _to_hours_mins_secs(epoch_time_taken)
@@ -1160,16 +1209,27 @@ class Engine(Serializable):
             except _EngineTerminateException:
                 self._fire_event(Events.TERMINATE)
 
+            except _EngineTerminateSingleEpochException:
+                raise RuntimeError(
+                    "The method terminate_epoch() should not be called on Event.STARTED or Event.EPOCH_STARTED."
+                    "If this is a desired behaviour, please open a feature request on"
+                    "https://github.com/pytorch/ignite/issues/new/choose"
+                )
+
             time_taken = time.time() - start_time
             # time is available for handlers but must be updated after fire
             self.state.times[Events.COMPLETED.name] = time_taken
-            handlers_start_time = time.time()
-            self._fire_event(Events.COMPLETED)
-            time_taken += time.time() - handlers_start_time
-            # update time wrt handlers
-            self.state.times[Events.COMPLETED.name] = time_taken
+
+            # do not fire Events.COMPLETED if we terminated the run with flag `skip_completed=True`
+            if self.should_terminate != "skip_completed":  # type: ignore[comparison-overlap]
+                handlers_start_time = time.time()
+                self._fire_event(Events.COMPLETED)
+                time_taken += time.time() - handlers_start_time
+                # update time wrt handlers
+                self.state.times[Events.COMPLETED.name] = time_taken
+
             hours, mins, secs = _to_hours_mins_secs(time_taken)
-            self.logger.info(f"Engine run complete. Time taken: {hours:02d}:{mins:02d}:{secs:06.3f}")
+            self.logger.info(f"Engine run finished. Time taken: {hours:02d}:{mins:02d}:{secs:06.3f}")
 
         except BaseException as e:
             self._dataloader_iter = None
@@ -1198,12 +1258,18 @@ class Engine(Serializable):
                 try:
                     # Avoid Events.GET_BATCH_STARTED triggered twice when data iter is restarted
                     if self.last_event_name != Events.DATALOADER_STOP_ITERATION:
-                        self._fire_event(Events.GET_BATCH_STARTED)
-                        self._maybe_terminate_legacy()
+                        # We should not trigger GET_BATCH_STARTED, GET_BATCH_COMPLETED, DATALOADER_STOP_ITERATION events
+                        # if no data was provided to engine.run(data=None, ...)
+                        if self.state.dataloader is not None:
+                            self._fire_event(Events.GET_BATCH_STARTED)
+                            self._maybe_terminate_legacy()
 
                     self.state.batch = next(self._dataloader_iter)
-                    self._fire_event(Events.GET_BATCH_COMPLETED)
-                    self._maybe_terminate_legacy()
+                    # We should not trigger GET_BATCH_STARTED, GET_BATCH_COMPLETED, DATALOADER_STOP_ITERATION events
+                    # if no data was provided to engine.run(data=None, ...)
+                    if self.state.dataloader is not None:
+                        self._fire_event(Events.GET_BATCH_COMPLETED)
+                        self._maybe_terminate_legacy()
 
                     iter_counter += 1
                     should_exit = False
@@ -1232,8 +1298,11 @@ class Engine(Serializable):
                             )
                         break
 
-                    self._fire_event(Events.DATALOADER_STOP_ITERATION)
-                    self._maybe_terminate_legacy()
+                    # We should not trigger GET_BATCH_STARTED, GET_BATCH_COMPLETED, DATALOADER_STOP_ITERATION events
+                    # if no data was provided to engine.run(data=None, ...)
+                    if self.state.dataloader is not None:
+                        self._fire_event(Events.DATALOADER_STOP_ITERATION)
+                        self._maybe_terminate_legacy()
 
                     self._setup_dataloader_iter()
                     should_exit = True
@@ -1257,7 +1326,6 @@ class Engine(Serializable):
 
         except _EngineTerminateSingleEpochException:
             self._fire_event(Events.TERMINATE_SINGLE_EPOCH, iter_counter=iter_counter)
-            self.should_terminate_single_epoch = False
             self._setup_dataloader_iter()
 
         except _EngineTerminateException as e:

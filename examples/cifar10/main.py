@@ -7,14 +7,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import utils
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 
 import ignite
 import ignite.distributed as idist
 from ignite.contrib.engines import common
-from ignite.contrib.handlers import PiecewiseLinear
 from ignite.engine import Engine, Events
-from ignite.handlers import Checkpoint, DiskSaver, global_step_from_engine
+from ignite.handlers import Checkpoint, DiskSaver, global_step_from_engine, PiecewiseLinear
 from ignite.metrics import Accuracy, Loss
 from ignite.utils import manual_seed, setup_logger
 
@@ -300,7 +300,7 @@ def create_trainer(model, optimizer, criterion, lr_scheduler, train_sampler, con
 
         model.train()
 
-        with autocast(enabled=with_amp):
+        with autocast("cuda", enabled=with_amp):
             y_pred = model(x)
             loss = criterion(y_pred, y)
 
@@ -356,7 +356,7 @@ def create_evaluator(model, metrics, config, tag="val"):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-        with autocast(enabled=with_amp):
+        with autocast("cuda", enabled=with_amp):
             output = model(x)
         return output, y
 
@@ -370,7 +370,7 @@ def create_evaluator(model, metrics, config, tag="val"):
 
 def get_save_handler(config):
     if config["with_clearml"]:
-        from ignite.contrib.handlers.clearml_logger import ClearMLSaver
+        from ignite.handlers.clearml_logger import ClearMLSaver
 
         return ClearMLSaver(dirname=config["output_path"])
 
